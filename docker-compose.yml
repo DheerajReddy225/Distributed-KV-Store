@@ -69,6 +69,17 @@ services:
       interval: 10s
       timeout: 5s
       retries: 3
+  
+  gateway:
+    image: nginx:alpine
+    ports:
+      - "8080:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf
+    depends_on:
+      - node-1
+      - node-2
+      - node-3
 
 volumes:
   node1-data:
