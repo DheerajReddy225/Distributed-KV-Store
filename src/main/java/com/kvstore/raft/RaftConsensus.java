@@ -7,208 +7,194 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 import org.springframework.web.client.RestTemplate;
+import org.springframework.http.client.SimpleClientHttpRequestFactory;
 
 import java.util.*;
-import java.util.concurrent.*;
 import java.util.concurrent.atomic.*;
 import java.util.logging.Logger;
 
-/**
- * RaftConsensus — replaces HealthCheckScheduler
- *
- * Implements the core Raft leader election mechanism:
- *  - Nodes start as FOLLOWER
- *  - If no heartbeat received within election timeout, become CANDIDATE and start election
- *  - CANDIDATE requests votes from all peers
- *  - If majority votes received, become LEADER
- *  - LEADER sends heartbeats every 50ms to prevent new elections
- *  - On leader change, updates NodeRegistry so the hash ring stays accurate
- */
 @Component
 public class RaftConsensus {
 
     private static final Logger log = Logger.getLogger(RaftConsensus.class.getName());
 
-    // ── Node states ──────────────────────────────────────────────────────────
     enum State { FOLLOWER, CANDIDATE, LEADER }
 
-    // ── Raft persistent state ────────────────────────────────────────────────
-    private final AtomicInteger currentTerm = new AtomicInteger(0);
-    private volatile String votedFor = null;
-    private volatile State currentState = State.FOLLOWER;
+    private final AtomicInteger currentTerm  = new AtomicInteger(0);
+    private volatile String     votedFor     = null;
+    private volatile State      currentState = State.FOLLOWER;
+    private volatile long       lastHeartbeatMs;
 
-    // ── Heartbeat tracking ───────────────────────────────────────────────────
-    private volatile long lastHeartbeatMs = System.currentTimeMillis();
-
-    // ── Config ───────────────────────────────────────────────────────────────
     @Value("${node.id:node-1}")
     private String selfId;
 
     @Value("${raft.election.timeout.min:150}")
     private int electionTimeoutMin;
 
-    @Value("${raft.election.timeout.max:300}")
+    @Value("${raft.election.timeout.max:600}")
     private int electionTimeoutMax;
 
     private final NodeRegistry nodeRegistry;
-    private final RestTemplate restTemplate = new RestTemplate();
-    private final Random random = new Random();
+    private final Random       random = new Random();
+
+    // Short timeout so a slow peer doesn't block the whole election
+    private final RestTemplate restTemplate;
 
     public RaftConsensus(NodeRegistry nodeRegistry) {
         this.nodeRegistry = nodeRegistry;
+
+        SimpleClientHttpRequestFactory factory = new SimpleClientHttpRequestFactory();
+        factory.setConnectTimeout(200);  // 200ms connect timeout
+        factory.setReadTimeout(200);     // 200ms read timeout
+        this.restTemplate = new RestTemplate(factory);
     }
 
     @PostConstruct
-    public void init() {
-        log.info("Raft starting on node: " + selfId + " as FOLLOWER");
+    public void init() throws InterruptedException {
+        // KEY FIX: each node waits a different random amount before starting
+        // This staggers the first election timeout across all nodes
+        int startupDelay = random.nextInt(electionTimeoutMax);
+        log.info(selfId + " waiting " + startupDelay + "ms before starting Raft");
+        Thread.sleep(startupDelay);
+        lastHeartbeatMs = System.currentTimeMillis();
+        log.info(selfId + " Raft started as FOLLOWER");
     }
 
-    /**
-     * Election timeout check — runs every 50ms
-     * If we haven't heard from a leader within the timeout window,
-     * start an election
-     */
-    @Scheduled(fixedDelay = 50)
+    @Scheduled(fixedDelay = 75)
     public void checkElectionTimeout() {
-        if (currentState == State.LEADER) return; // leaders don't start elections
+        if (currentState == State.LEADER) return;
 
         long elapsed = System.currentTimeMillis() - lastHeartbeatMs;
-        int timeout = electionTimeoutMin
+        int timeout  = electionTimeoutMin
                 + random.nextInt(electionTimeoutMax - electionTimeoutMin);
 
         if (elapsed > timeout) {
-            log.info(selfId + " election timeout — starting election for term "
+            log.info(selfId + " timed out after " + elapsed
+                    + "ms — starting election for term "
                     + (currentTerm.get() + 1));
             startElection();
         }
     }
 
-    /**
-     * Heartbeat sender — runs every 50ms
-     * Only the LEADER sends heartbeats to prevent followers from timing out
-     */
     @Scheduled(fixedDelay = 50)
     public void sendHeartbeats() {
         if (currentState != State.LEADER) return;
 
-        for (Map.Entry<String, String> entry : nodeRegistry.getAddressMap().entrySet()) {
+        for (Map.Entry<String, String> entry
+                : nodeRegistry.getAddressMap().entrySet()) {
             String nodeId = entry.getKey();
             if (nodeId.equals(selfId)) continue;
 
             String url = nodeRegistry.getBaseUrl(nodeId) + "/raft/heartbeat";
             try {
                 Map<String, Object> body = new HashMap<>();
-                body.put("term", currentTerm.get());
+                body.put("term",     currentTerm.get());
                 body.put("leaderId", selfId);
                 restTemplate.postForEntity(url, body, Void.class);
                 nodeRegistry.updateHealth(nodeId, true);
             } catch (Exception e) {
-                log.warning("Heartbeat failed to " + nodeId + " — marking dead");
+                log.warning("Heartbeat failed to " + nodeId);
                 nodeRegistry.updateHealth(nodeId, false);
             }
         }
     }
 
-    /**
-     * Start an election:
-     * 1. Increment term
-     * 2. Vote for self
-     * 3. Request votes from peers
-     * 4. If majority — become leader
-     */
     private synchronized void startElection() {
-        currentState = State.CANDIDATE;
-        int newTerm = currentTerm.incrementAndGet();
-        votedFor = selfId;
+        // If someone else already won while we were waiting, don't start
+        if (currentState == State.LEADER) return;
 
-        int votes = 1; // vote for self
+        currentState = State.CANDIDATE;
+        int newTerm  = currentTerm.incrementAndGet();
+        votedFor     = selfId;
+
+        int votes      = 1; // vote for self
         int totalNodes = nodeRegistry.getAddressMap().size();
 
-        for (Map.Entry<String, String> entry : nodeRegistry.getAddressMap().entrySet()) {
+        log.info(selfId + " requesting votes for term " + newTerm
+                + " from " + (totalNodes - 1) + " peers");
+
+        for (Map.Entry<String, String> entry
+                : nodeRegistry.getAddressMap().entrySet()) {
             String nodeId = entry.getKey();
             if (nodeId.equals(selfId)) continue;
 
             try {
                 String url = nodeRegistry.getBaseUrl(nodeId) + "/raft/vote";
                 Map<String, Object> request = new HashMap<>();
-                request.put("term", newTerm);
+                request.put("term",        newTerm);
                 request.put("candidateId", selfId);
 
                 ResponseEntity<Map> response =
                         restTemplate.postForEntity(url, request, Map.class);
 
                 if (response.getBody() != null
-                        && Boolean.TRUE.equals(response.getBody().get("voteGranted"))) {
+                        && Boolean.TRUE.equals(
+                                response.getBody().get("voteGranted"))) {
                     votes++;
-                    log.info("Vote received from " + nodeId
-                            + " — total votes: " + votes);
+                    log.info(selfId + " got vote from " + nodeId
+                            + " — total: " + votes + "/" + totalNodes);
                 }
             } catch (Exception e) {
-                log.warning("Vote request failed to " + nodeId);
+                log.warning(selfId + " vote request to " + nodeId
+                        + " failed: " + e.getMessage());
             }
         }
 
-        // Check if we won the majority
         if (votes > totalNodes / 2) {
             becomeLeader();
         } else {
             log.info(selfId + " lost election for term " + newTerm
-                    + " — reverting to FOLLOWER");
-            currentState = State.FOLLOWER;
+                    + " with " + votes + "/" + totalNodes + " votes — back to FOLLOWER");
+            currentState    = State.FOLLOWER;
+            lastHeartbeatMs = System.currentTimeMillis(); // reset so we don't immediately retry
         }
     }
 
-    /**
-     * Become the leader — update the cluster registry
-     * This is the ONLY point where Raft connects to the rest of the system
-     */
     private void becomeLeader() {
         currentState = State.LEADER;
-        log.info("*** " + selfId + " became LEADER for term "
+        log.info("*** " + selfId + " is now LEADER for term "
                 + currentTerm.get() + " ***");
-        // Mark self as alive in the registry — same method health checker used
         nodeRegistry.updateHealth(selfId, true);
     }
 
-    /**
-     * Called by RaftController when a heartbeat arrives from the leader
-     */
     public synchronized void receiveHeartbeat(int term, String leaderId) {
         if (term >= currentTerm.get()) {
+            if (currentState == State.CANDIDATE || currentState == State.LEADER) {
+                log.info(selfId + " stepping down — received heartbeat from "
+                        + leaderId + " term " + term);
+            }
             currentTerm.set(term);
-            currentState = State.FOLLOWER;
-            votedFor = null;
+            currentState    = State.FOLLOWER;
+            votedFor        = null;
             lastHeartbeatMs = System.currentTimeMillis();
             nodeRegistry.updateHealth(leaderId, true);
         }
     }
 
-    /**
-     * Called by RaftController when a vote request arrives
-     * Grant vote if:
-     *  - The candidate's term is >= our term
-     *  - We haven't voted for anyone else this term
-     */
     public synchronized boolean handleVoteRequest(int term, String candidateId) {
         if (term > currentTerm.get()) {
             currentTerm.set(term);
             currentState = State.FOLLOWER;
-            votedFor = null;
+            votedFor     = null;
         }
 
         boolean voteGranted = (term >= currentTerm.get())
                 && (votedFor == null || votedFor.equals(candidateId));
 
         if (voteGranted) {
-            votedFor = candidateId;
-            lastHeartbeatMs = System.currentTimeMillis(); // reset timeout
+            votedFor        = candidateId;
+            lastHeartbeatMs = System.currentTimeMillis();
             log.info(selfId + " voted for " + candidateId
                     + " in term " + term);
+        } else {
+            log.info(selfId + " denied vote for " + candidateId
+                    + " in term " + term
+                    + " (already voted for: " + votedFor + ")");
         }
 
         return voteGranted;
     }
 
-    public State getCurrentState() { return currentState; }
-    public int getCurrentTerm()    { return currentTerm.get(); }
+    public State   getCurrentState() { return currentState; }
+    public int     getCurrentTerm()  { return currentTerm.get(); }
 }
