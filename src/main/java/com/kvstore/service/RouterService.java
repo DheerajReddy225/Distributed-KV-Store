@@ -2,6 +2,7 @@ package com.kvstore.service;
 
 import com.kvstore.config.NodeRegistry;
 import com.kvstore.hashing.ConsistentHashRing;
+import com.kvstore.raft.RaftConsensus;
 import com.kvstore.replication.ReplicationService;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.*;
@@ -12,17 +13,10 @@ import java.util.Optional;
 import java.util.logging.Logger;
 
 /**
- * RouterService
+ * RouterService — updated to route all writes through the Raft leader.
  *
- * Sits in front of the local StorageService and handles two cases:
- *
- *  Case A — This node IS the primary for the key:
- *    Write locally, then fan-out replication to replicas.
- *
- *  Case B — This node is NOT the primary:
- *    Forward the request to the correct primary node and return its response.
- *    This gives clients a single-node API — they can talk to ANY node and
- *    always get the right answer (transparent routing).
+ * Reads  → still go to any node that has the key (low latency)
+ * Writes → always forwarded to the LEADER who applies write quorum
  */
 @Service
 public class RouterService {
@@ -32,32 +26,40 @@ public class RouterService {
     @Value("${node.id:node-1}")
     private String selfId;
 
-    private final ConsistentHashRing hashRing;
-    private final NodeRegistry nodeRegistry;
-    private final StorageService storageService;
-    private final ReplicationService replicationService;
-    private final RestTemplate restTemplate = new RestTemplate();
+    private final ConsistentHashRing  hashRing;
+    private final NodeRegistry        nodeRegistry;
+    private final StorageService      storageService;
+    private final ReplicationService  replicationService;
+    private final RaftConsensus       raftConsensus;
+    private final RestTemplate        restTemplate = new RestTemplate();
 
-    public RouterService(ConsistentHashRing hashRing, NodeRegistry nodeRegistry,
-                         StorageService storageService, ReplicationService replicationService) {
-        this.hashRing = hashRing;
-        this.nodeRegistry = nodeRegistry;
-        this.storageService = storageService;
+    public RouterService(ConsistentHashRing hashRing,
+                         NodeRegistry nodeRegistry,
+                         StorageService storageService,
+                         ReplicationService replicationService,
+                         RaftConsensus raftConsensus) {
+        this.hashRing          = hashRing;
+        this.nodeRegistry      = nodeRegistry;
+        this.storageService    = storageService;
         this.replicationService = replicationService;
+        this.raftConsensus     = raftConsensus;
     }
 
+    /**
+     * GET — reads still go to any node holding the key.
+     * Eventual consistency on reads keeps latency low.
+     */
     public Optional<String> get(String key) {
-        // For reads, check locally first (we may be a replica holding the value)
         Optional<String> local = storageService.get(key);
         if (local.isPresent()) return local;
 
-        // If not found locally, forward to primary
         String primary = hashRing.getPrimaryNode(key);
         if (primary.equals(selfId)) return Optional.empty();
 
         try {
             String url = nodeRegistry.getBaseUrl(primary) + "/kv/" + key;
-            ResponseEntity<String> resp = restTemplate.getForEntity(url, String.class);
+            ResponseEntity<String> resp =
+                    restTemplate.getForEntity(url, String.class);
             return resp.getStatusCode().is2xxSuccessful()
                     ? Optional.ofNullable(resp.getBody())
                     : Optional.empty();
@@ -67,39 +69,54 @@ public class RouterService {
         }
     }
 
+    /**
+     * PUT — all writes go through the Raft leader.
+     * If this node is the leader → write locally + quorum replication.
+     * If this node is a follower → forward to the leader.
+     */
     public void put(String key, String value) {
-        String primary = hashRing.getPrimaryNode(key);
-
-        if (primary.equals(selfId)) {
-            // We own this key — write locally and replicate
+        if (raftConsensus.isLeader()) {
+            // I am the leader — write locally and replicate with quorum
             storageService.put(key, value);
-            replicationService.replicatePut(key, value);
+            replicationService.replicatePutWithQuorum(key, value);
         } else {
-            // Forward to the correct primary
-            forwardPut(primary, key, value);
+            // Forward to the current leader
+            String leaderId = raftConsensus.getCurrentLeaderId();
+            if (leaderId == null) {
+                throw new RuntimeException(
+                        "No leader elected yet — cluster is stabilising, please retry");
+            }
+            forwardPut(leaderId, key, value);
         }
     }
 
+    /**
+     * DELETE — same pattern as PUT, routes through the leader.
+     */
     public boolean delete(String key) {
-        String primary = hashRing.getPrimaryNode(key);
-
-        if (primary.equals(selfId)) {
+        if (raftConsensus.isLeader()) {
             boolean deleted = storageService.delete(key);
-            if (deleted) replicationService.replicateDelete(key);
+            if (deleted) replicationService.replicateDeleteWithQuorum(key);
             return deleted;
         } else {
-            return forwardDelete(primary, key);
+            String leaderId = raftConsensus.getCurrentLeaderId();
+            if (leaderId == null) return false;
+            return forwardDelete(leaderId, key);
         }
     }
+
+    // ── Forwarding helpers ──────────────────────────────────────────────────
 
     private void forwardPut(String nodeId, String key, String value) {
         try {
             String url = nodeRegistry.getBaseUrl(nodeId) + "/kv/" + key;
             HttpHeaders headers = new HttpHeaders();
             headers.setContentType(MediaType.TEXT_PLAIN);
-            restTemplate.exchange(url, HttpMethod.PUT, new HttpEntity<>(value, headers), Void.class);
+            restTemplate.exchange(url, HttpMethod.PUT,
+                    new HttpEntity<>(value, headers), Void.class);
         } catch (Exception e) {
-            throw new RuntimeException("Forward PUT to " + nodeId + " failed: " + e.getMessage(), e);
+            throw new RuntimeException(
+                    "Forward PUT to leader " + nodeId + " failed: " + e.getMessage(), e);
         }
     }
 
@@ -109,7 +126,8 @@ public class RouterService {
             restTemplate.delete(url);
             return true;
         } catch (Exception e) {
-            log.warning("Forward DELETE to " + nodeId + " failed: " + e.getMessage());
+            log.warning("Forward DELETE to leader " + nodeId + " failed: "
+                    + e.getMessage());
             return false;
         }
     }

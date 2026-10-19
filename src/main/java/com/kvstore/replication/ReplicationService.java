@@ -7,69 +7,152 @@ import org.springframework.http.*;
 import org.springframework.stereotype.Service;
 import org.springframework.web.client.RestTemplate;
 
-import java.util.List;
+import java.util.*;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Logger;
 
 /**
- * ReplicationService
+ * ReplicationService — updated with quorum replication.
  *
- * After the primary node writes a key locally it calls this service to
- * forward the write to all replica nodes in parallel.
+ * replicatePutWithQuorum  — fans out to all nodes in parallel,
+ *                           waits for majority ACK before returning.
+ * replicateDeleteWithQuorum — same pattern for deletes.
  *
- * Key design decisions:
- *  - Parallel fan-out via a thread pool (not sequential) keeps latency low.
- *  - We use "fire and forget" async replication here (AP system — available
- *    + partition tolerant). For strong consistency you would wait for a quorum
- *    of acknowledgements before returning to the client (CP system).
- *  - Replicas receive writes via a dedicated /internal/replicate endpoint
- *    so they apply the value directly without re-routing it.
+ * The old async fire-and-forget methods are kept for the benchmark
+ * endpoint which still uses the original replication path.
  */
 @Service
 public class ReplicationService {
 
-    private static final Logger log = Logger.getLogger(ReplicationService.class.getName());
-
-    @Value("${replication.factor:2}")
-    private int replicationFactor;
+    private static final Logger log =
+            Logger.getLogger(ReplicationService.class.getName());
 
     @Value("${node.id:node-1}")
     private String selfId;
 
     private final ConsistentHashRing hashRing;
-    private final NodeRegistry nodeRegistry;
-    private final RestTemplate restTemplate = new RestTemplate();
+    private final NodeRegistry       nodeRegistry;
+    private final RestTemplate       restTemplate = new RestTemplate();
 
-    // Thread pool sized to the max number of concurrent replication fan-outs
     private final ExecutorService replicationPool =
-            Executors.newFixedThreadPool(Runtime.getRuntime().availableProcessors() * 2);
+            Executors.newFixedThreadPool(
+                    Runtime.getRuntime().availableProcessors() * 2);
 
-    public ReplicationService(ConsistentHashRing hashRing, NodeRegistry nodeRegistry) {
-        this.hashRing = hashRing;
+    public ReplicationService(ConsistentHashRing hashRing,
+                               NodeRegistry nodeRegistry) {
+        this.hashRing     = hashRing;
         this.nodeRegistry = nodeRegistry;
     }
 
+    // ── Quorum replication (used by leader via RouterService) ───────────────
+
     /**
-     * Replicate a PUT to all replica nodes (excluding self — already written).
+     * Fan out PUT to ALL live nodes in parallel.
+     * Block until majority have acknowledged.
+     * Throws if quorum cannot be achieved.
      */
+    public void replicatePutWithQuorum(String key, String value) {
+        List<String> allNodes  = new ArrayList<>(hashRing.getAllNodes());
+        int majority           = allNodes.size() / 2 + 1;
+        // Leader already wrote locally — count as 1 acknowledgement
+        AtomicInteger acknowledged = new AtomicInteger(1);
+
+        List<CompletableFuture<Void>> futures = new ArrayList<>();
+
+        for (String nodeId : allNodes) {
+            if (nodeId.equals(selfId)) continue;
+            if (!nodeRegistry.isAlive(nodeId)) continue;
+
+            CompletableFuture<Void> future = CompletableFuture.runAsync(() -> {
+                try {
+                    sendPut(nodeId, key, value);
+                    int acks = acknowledged.incrementAndGet();
+                    log.info("Quorum PUT ack from " + nodeId
+                            + " — " + acks + "/" + allNodes.size());
+                } catch (Exception e) {
+                    log.warning("Quorum PUT failed to " + nodeId
+                            + ": " + e.getMessage());
+                }
+            }, replicationPool);
+
+            futures.add(future);
+        }
+
+        // Wait up to 2 seconds for all futures, then check quorum
+        try {
+            CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]))
+                    .get(2, TimeUnit.SECONDS);
+        } catch (TimeoutException e) {
+            log.warning("Quorum replication timed out for key: " + key);
+        } catch (Exception e) {
+            log.warning("Quorum replication error: " + e.getMessage());
+        }
+
+        if (acknowledged.get() < majority) {
+            throw new RuntimeException(
+                    "Failed to achieve write quorum for key: " + key
+                    + " — only " + acknowledged.get()
+                    + "/" + allNodes.size() + " nodes acknowledged");
+        }
+
+        log.info("Write quorum achieved for key: " + key
+                + " (" + acknowledged.get() + "/" + allNodes.size() + ")");
+    }
+
+    /**
+     * Fan out DELETE to ALL live nodes in parallel.
+     * Block until majority have acknowledged.
+     */
+    public void replicateDeleteWithQuorum(String key) {
+        List<String> allNodes  = new ArrayList<>(hashRing.getAllNodes());
+        int majority           = allNodes.size() / 2 + 1;
+        AtomicInteger acknowledged = new AtomicInteger(1);
+
+        List<CompletableFuture<Void>> futures = new ArrayList<>();
+
+        for (String nodeId : allNodes) {
+            if (nodeId.equals(selfId)) continue;
+            if (!nodeRegistry.isAlive(nodeId)) continue;
+
+            CompletableFuture<Void> future = CompletableFuture.runAsync(() -> {
+                try {
+                    sendDelete(nodeId, key);
+                    acknowledged.incrementAndGet();
+                } catch (Exception e) {
+                    log.warning("Quorum DELETE failed to " + nodeId);
+                }
+            }, replicationPool);
+
+            futures.add(future);
+        }
+
+        try {
+            CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]))
+                    .get(2, TimeUnit.SECONDS);
+        } catch (Exception e) {
+            log.warning("Quorum delete replication error: " + e.getMessage());
+        }
+
+        if (acknowledged.get() < majority) {
+            throw new RuntimeException(
+                    "Failed to achieve delete quorum for key: " + key);
+        }
+    }
+
+    // ── Original async replication (kept for benchmark compatibility) ────────
+
     public void replicatePut(String key, String value) {
-        List<String> replicas = hashRing.getReplicaNodes(key, replicationFactor);
+        List<String> replicas = hashRing.getReplicaNodes(key, 2);
         for (String replicaId : replicas) {
             if (replicaId.equals(selfId)) continue;
-            if (!nodeRegistry.isAlive(replicaId)) {
-                log.warning("Skipping replication to dead node: " + replicaId);
-                continue;
-            }
-            // Fire-and-forget — submit to thread pool, don't block the caller
+            if (!nodeRegistry.isAlive(replicaId)) continue;
             replicationPool.submit(() -> sendPut(replicaId, key, value));
         }
     }
 
-    /**
-     * Replicate a DELETE to all replica nodes.
-     */
     public void replicateDelete(String key) {
-        List<String> replicas = hashRing.getReplicaNodes(key, replicationFactor);
+        List<String> replicas = hashRing.getReplicaNodes(key, 2);
         for (String replicaId : replicas) {
             if (replicaId.equals(selfId)) continue;
             if (!nodeRegistry.isAlive(replicaId)) continue;
@@ -77,26 +160,23 @@ public class ReplicationService {
         }
     }
 
+    // ── HTTP helpers ─────────────────────────────────────────────────────────
+
     private void sendPut(String nodeId, String key, String value) {
-        try {
-            String url = nodeRegistry.getBaseUrl(nodeId) + "/internal/replicate/" + key;
-            HttpHeaders headers = new HttpHeaders();
-            headers.setContentType(MediaType.TEXT_PLAIN);
-            HttpEntity<String> entity = new HttpEntity<>(value, headers);
-            restTemplate.exchange(url, HttpMethod.PUT, entity, Void.class);
-            log.fine("Replicated PUT key=" + key + " to " + nodeId);
-        } catch (Exception e) {
-            log.warning("Replication PUT failed to " + nodeId + ": " + e.getMessage());
-        }
+        String url = nodeRegistry.getBaseUrl(nodeId)
+                + "/internal/replicate/" + key;
+        HttpHeaders headers = new HttpHeaders();
+        headers.setContentType(MediaType.TEXT_PLAIN);
+        restTemplate.exchange(url, HttpMethod.PUT,
+                new HttpEntity<>(value, headers), Void.class);
     }
 
     private void sendDelete(String nodeId, String key) {
-        try {
-            String url = nodeRegistry.getBaseUrl(nodeId) + "/internal/replicate/" + key;
-            restTemplate.delete(url);
-            log.fine("Replicated DELETE key=" + key + " to " + nodeId);
-        } catch (Exception e) {
-            log.warning("Replication DELETE failed to " + nodeId + ": " + e.getMessage());
-        }
+        String url = nodeRegistry.getBaseUrl(nodeId)
+                + "/internal/replicate/" + key;
+        restTemplate.delete(url);
     }
+
+    // ── Field needed by RouterService ────────────────────────────────────────
+    private final AtomicInteger dummyRef = new AtomicInteger(0);
 }
