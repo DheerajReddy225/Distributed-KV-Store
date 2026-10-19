@@ -13,6 +13,8 @@ version: "3.9"
 x-common-env: &common-env
   NODE_PEERS: "node-1:8080,node-2:8080,node-3:8080"
   REPLICATION_FACTOR: "2"
+  RAFT_ELECTION_TIMEOUT_MIN: "150"
+  RAFT_ELECTION_TIMEOUT_MAX: "600"
 
 services:
 
